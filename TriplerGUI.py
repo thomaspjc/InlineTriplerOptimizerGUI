@@ -39,6 +39,7 @@ from scipy.stats import norm
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel as C
 
+from tqdm import tqdm
 
 
 text_font = None
@@ -50,7 +51,7 @@ STANFORD_BLUE   = "#006CB8"
 STANFORD_GREEN  = "#1AECBA"
 
 # Polling
-POLL_PERIOD = 0.2  # seconds between PV.get()
+POLL_PERIOD = 0.01  # seconds between PV.get()
 
 
 # ——— EPICS FALLBACK / TEST MODE —————————————————————————————
@@ -119,8 +120,9 @@ class MotorMonitor:
                 val = None
             if val != last:
                 last = val
+            #self.on_change(val)
             try:
-                self.on_update(val)
+                self.on_change(val)
             except RuntimeError:
                 time.sleep(0)
             time.sleep(self.poll)
@@ -153,6 +155,7 @@ class EnergyMonitor:
                 val = self.pv.get()
             except Exception:
                 val = None
+            #self.on_update(val)
             try:
                 self.on_update(val)
             except RuntimeError:
@@ -416,12 +419,12 @@ class App(tk.Tk):
 
         """
         super().__init__()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         
-        # event to tell optimizer/GA loops to quit early
-        self._kill_opt = threading.Event()
+        
         
         self.title(f"Motor Control{' (TEST MODE)' if not EPICS_AVAILABLE else ''}")
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        
 
         # state for 4 motors
         self.monitors = [None]*4
@@ -448,13 +451,17 @@ class App(tk.Tk):
         self.energy_times  = []
         self.energy_values = []
         self.energy_index = 0
+        
+        self._load_assets()
+        
+        # event to tell optimizer/GA loops to quit early
+        self._kill_opt = threading.Event()
+        
         # instantiate and start the monitor
         self.energy_monitor = EnergyMonitor(self.ENERGY_PV, on_update=self._on_energy)
         self.after(0, self.energy_monitor.start)
 
         
-        self._load_assets()
-
         self._build_ui()
 
         
@@ -498,14 +505,14 @@ class App(tk.Tk):
         self.nb = ttk.Notebook(self)
 
         self.nb.bind("<Configure>", self._center_tabs)
-        self.tab1 = tk.Frame(self.nb); tab2 = tk.Frame(self.nb)
+        self.tab1 = tk.Frame(self.nb); self.tab2 = tk.Frame(self.nb)
         self.nb.add(self.tab1, text="Inline Tripler Optimizer")
-        self.nb.add(tab2, text="Manual Control")
+        self.nb.add(self.tab2, text="Manual Control")
         self.nb.pack(fill=tk.BOTH, expand=True)
 
         self._build_optimize_tab(self.tab1)
 
-        self._build_manual_tab(tab2)
+        self._build_manual_tab(self.tab2)
 
 
     # ——— Tab 1: Inline Tripler Optimizer —————————————————————
@@ -562,6 +569,8 @@ class App(tk.Tk):
         self._energy_canvas = FigureCanvasTkAgg(self.fig, master=ef)
         self._energy_canvas.draw()
         self._energy_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        self._toggle_dark()
 
     def _make_optimizer_panel(self, parent, motor_idx, col, title):
         """Create the SHG/THG crystal jog panels on Tab 1."""
@@ -599,7 +608,7 @@ class App(tk.Tk):
         """
         
         # Intilize the optimizer
-        print("Running optimizer on Motors 1, 3")
+        print("Running optimizer")
         # clear any previous kill-flag
         self._kill_opt.clear()
         self.stop_btn.config(state=tk.NORMAL)
@@ -712,14 +721,23 @@ class App(tk.Tk):
         scan_f = tk.LabelFrame(parent, text="Motor Scan", padx=10, pady=10)
         scan_f.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(20,10))
         
-        # 0) ADD “Scan Mode” dropdown
+        '''# 0) ADD “Scan Mode” dropdown
         tk.Label(scan_f, text="Mode:").grid(row=0, column=0, sticky="e", padx=(15,0))
         # Choices: “1D” or “2D”
         mode_menu = tk.OptionMenu(scan_f, self.scan_mode, "1D", "2D")
         self.scan_mode.trace_add("write", self._on_scan_mode_change)
         mode_menu.config(width=6)  # optional: set a fixed width
         mode_menu.grid(row=0, column=1, sticky="w", padx=(2,10))
-        # END “Scan Mode” dropdown
+        # END “Scan Mode” dropdown'''
+        self.scan_mode.set("2D")
+        tk.Label(scan_f, text="Mode:").grid(row=0, column=0, sticky="e", padx=(15,0))
+        self.mode_btn = tk.Button(
+            scan_f,
+            text="2D",
+            width=6,
+            command=self._toggle_scan_mode
+        )
+        self.mode_btn.grid(row=0, column=1, sticky="w")
         
         
         # Motor index
@@ -745,8 +763,8 @@ class App(tk.Tk):
         self.scan_step1.grid(row=1, column=7, sticky="w", pady=(5,0))
         
         tk.Label(scan_f, text="# Acqs each:").grid(row=1, column=8, sticky="e", padx=(15,0), pady=(5,0))
-        self.scan_nacq1 = tk.Entry(scan_f, width=6); self.scan_nacq1.insert(0, "5")
-        self.scan_nacq1.grid(row=1, column=9, sticky="w", pady=(5,0))
+        self.scan_nacq = tk.Entry(scan_f, width=6); self.scan_nacq.insert(0, "5")
+        self.scan_nacq.grid(row=1, column=9, sticky="w", pady=(5,0))
         
 
         # Motor index
@@ -768,12 +786,6 @@ class App(tk.Tk):
         self.scan_step2 = tk.Entry(scan_f, width=8); self.scan_step2.insert(0, "0.1")
         self.scan_step2.grid(row=2, column=7, sticky="w", pady=(5,0))
         
-        tk.Label(scan_f, text="# Acqs each:").grid(row=2, column=8, sticky="e", padx=(15,0), pady=(5,0))
-        self.scan_nacq2 = tk.Entry(scan_f, width=6); self.scan_nacq2.insert(0, "5")
-        self.scan_nacq2.grid(row=2, column=9, sticky="w", pady=(5,0))
-            
-        
-            
         
         # “Save To…” button & filename label
         
@@ -782,32 +794,33 @@ class App(tk.Tk):
         self.scan_fname_lbl = tk.Entry(scan_f, width=42); self.scan_fname_lbl.insert(0, "No file chosen")
         self.scan_fname_lbl.grid(row=5, column=1, columnspan=6, sticky="w", pady=(5,0))
         
-        '''tk.Button(scan_f, text="Save To…", command=self._choose_scan_file) \
-            .grid(row=5, column=0, padx=(15,0), pady=(5,0))
         
-        self.scan_fname_lbl = tk.Label(scan_f, text="No file chosen", anchor="w")
-        self.scan_fname_lbl.grid(row=5, column=1, columnspan=6, sticky="ew", padx=(15,0), pady=(5,0))
-        '''
         # “Start Scan” button
         self.scan_btn = tk.Button(scan_f, text="Start Scan", command=self._on_start_scan)
         self.scan_btn.grid(row=6, column=0,  pady=(10,0), padx=(15,0))
-        self.stop_scan_btn = tk.Button(scan_f, text="Stop Scan", command=self._on_start_scan)
+        self.stop_scan_btn = tk.Button(scan_f, text="Stop Scan", command=self._on_stop_scan)
         self.stop_scan_btn.config(state=tk.DISABLED)
         self.stop_scan_btn.grid(row=6, column=1,  pady=(10,0), padx=(15,0))
         
-        self._on_scan_mode_change()
-        
-    def _on_scan_mode_change(self, *args):
-        mode = self.scan_mode.get()
-        # If mode is "1D", disable all row-2 Entry widgets; if "2D", enable them.
-        state = "normal" if mode == "2D" else "disabled"
     
-        # Disable/enable each of the row-2 entries:
-        self.scan_motor2_idx.config(state=state)
-        self.scan_start2    .config(state=state)
-        self.scan_stop2     .config(state=state)
-        self.scan_step2     .config(state=state)
-        self.scan_nacq2     .config(state=state)
+        
+    def _toggle_scan_mode(self):
+        # 1) flip the scan_mode Var and update the button text
+        if self.scan_mode.get() == "1D":
+            self.scan_mode.set("2D")
+            self.mode_btn.config(text="2D")
+            new_state = "normal"
+        else:
+            self.scan_mode.set("1D")
+            self.mode_btn.config(text="1D")
+            new_state = "disabled"
+    
+        # 2) now enable/disable row-2 entries all at once
+        for w in (self.scan_motor2_idx,
+                  self.scan_start2,
+                  self.scan_stop2,
+                  self.scan_step2):
+            w.config(state=new_state)
 
     def _make_manual_panel(self, parent, motor_idx, row, col):
         """Small panel with PV/connect, readback, step + jog ◀/▶."""
@@ -854,6 +867,14 @@ class App(tk.Tk):
                   command=lambda i=motor_idx: self._jog(i, +1)
                  ).pack(side=tk.LEFT, padx=4)
             
+        
+    def _on_stop_scan(self):
+        self.stop_scan_btn.config(state=tk.DISABLED)
+        
+        if hasattr(self, "_scan_stop"):
+            self._scan_stop.set()
+
+    
     def _on_start_scan(self):
         # 1) Parse & validate
         self.scan_fname = self.scan_fname_lbl.get()
@@ -863,22 +884,22 @@ class App(tk.Tk):
             start = float(self.scan_start1.get())
             stop  = float(self.scan_stop1.get())
             step  = float(self.scan_step1.get())
-            nacq  = int(self.scan_nacq1.get())
-            fname = getattr(self, "scan_fname", None)
+            nacq  = int(self.scan_nacq.get())
+            fname = str(getattr(self, "scan_fname", None))
             if not (0 <= idx < 4) or step <= 0 or nacq < 1 or not fname:
                 raise ValueError
             if len(fname.split('.h5')) != 2:
                 raise ValueError('The file name should have the h5 extension')
             args = [idx, start, stop, step, nacq, fname]
             if self.scan_mode.get() == '2D':
-                idx   = int(self.scan_motor1_idx.get()) - 1
-                start = float(self.scan_start1.get())
-                stop  = float(self.scan_stop1.get())
-                step  = float(self.scan_step1.get())
-                nacq  = int(self.scan_nacq1.get())
+                idx   = int(self.scan_motor2_idx.get()) - 1
+                start = float(self.scan_start2.get())
+                stop  = float(self.scan_stop2.get())
+                step  = float(self.scan_step2.get())
                 if not (0 <= idx < 4) or step <= 0 or nacq < 1 or not fname:
                     raise ValueError
-                args += [idx, start, stop, step, nacq]
+                args += [idx, start, stop, step]
+
         except ValueError:
             messagebox.showerror("Invalid scan parameters",
                                  "Please check motor #, start/stop/step, #acqs, and file.",
@@ -887,16 +908,20 @@ class App(tk.Tk):
         
         # 2) Disable the button & start scan thread
         self.scan_btn.config(state=tk.DISABLED)
+        self.stop_scan_btn.config(state=tk.NORMAL)
         self._scan_stop = threading.Event()
         self._scan_thr = threading.Thread(
             target=self._run_scan,
-            args=(idx, start, stop, step, nacq, fname),
+            args=args,
             daemon=True
         )
         self._scan_thr.start()
         
-    def _run_scan(self, motor_idx1, start1, stop1, step1, nacq1, fname,
-                  motor_idx2 = None, start2 = None, stop2 = None, step2 = None, nacq2 = None):
+
+        
+        
+    def _run_scan(self, motor_idx1, start1, stop1, step1, nacq, fname,
+                  motor_idx2 = None, start2 = None, stop2 = None, step2 = None):
         
         if self.scan_mode.get() == '1D':
             # build positions array
@@ -906,10 +931,12 @@ class App(tk.Tk):
             with h5py.File(fname, "w") as f:
                 ds_p = f.create_dataset("positions", data=positions)
                 ds_e = f.create_dataset("energies",
-                                        shape=(len(positions), nacq1),
+                                        shape=(len(positions), nacq),
                                         dtype="f8")
         
                 for i, pos in enumerate(positions):
+                    if self._scan_stop.is_set():
+                        break
                     # ensure motor monitor exists
                     mon = self.monitors[motor_idx1]
                     if mon is None:
@@ -923,7 +950,9 @@ class App(tk.Tk):
                     time.sleep(POLL_PERIOD * 5)
         
                     # take multiple acquisitions
-                    for j in range(nacq1):
+                    for j in range(nacq):
+                        if self._scan_stop.is_set():
+                            break
                         e = float(PV(self.ENERGY_PV).get())
                         ds_e[i, j] = e
                         time.sleep(POLL_PERIOD)
@@ -932,41 +961,67 @@ class App(tk.Tk):
                     f.flush()
         else: 
             # build positions array
-            positions = np.arange(start1, stop1 + 1e-12, step1)
-        
+            positions1 = np.arange(start1, stop1 + step1, step1)
+            positions2 = np.arange(start2, stop2 + step2, step2)
+            motor1, motor2 = np.meshgrid(positions1, positions2)
+            motor1[1::2] = motor1[1::2, ::-1]
             # open HDF5 file
             with h5py.File(fname, "w") as f:
-                ds_p = f.create_dataset("positions", data=positions)
+                ds_p1 = f.create_dataset("motor1", data=motor1)
+                ds_p2 = f.create_dataset("motor2", data=motor2)
                 ds_e = f.create_dataset("energies",
-                                        shape=(len(positions), nacq1),
+                                        shape=(motor1.shape[0], motor1.shape[1], nacq),
                                         dtype="f8")
-        
-                for i, pos in enumerate(positions):
+
+                positions1[:] = positions1[::-1]
+                for i in tqdm(range(len(positions2)), ascii = True, desc = "Scanning Motors"):
+                    if self._scan_stop.is_set():
+                        break
+                    pos2 = positions2[i]
+
                     # ensure motor monitor exists
-                    mon = self.monitors[motor_idx1]
-                    if mon is None:
-                        name = self.pv_entries[motor_idx1].get().strip()
-                        mon = MotorMonitor(name, on_change=lambda v: None)
-                        mon.start()
-                        self.monitors[motor_idx1] = mon
-        
+                    mon2 = self.monitors[motor_idx2]
+
+                    if mon2 is None:
+                        name = self.pv_entries[motor_idx2].get().strip()
+                        mon2 = MotorMonitor(name, on_change=lambda v: None)
+                        mon2.start()
+                        self.monitors[motor_idx2] = mon2
                     # move motor & settle
-                    mon.pv.put(pos)
+                    mon2.pv.put(pos2)
+                    positions1[:] = positions1[::-1]
                     time.sleep(POLL_PERIOD * 5)
-        
-                    # take multiple acquisitions
-                    for j in range(nacq1):
-                        e = float(PV(self.ENERGY_PV).get())
-                        ds_e[i, j] = e
-                        time.sleep(POLL_PERIOD)
-        
-                    # flush after each row
-                    f.flush()
+                    
+                    for j, pos1 in enumerate(positions1):
+                        if self._scan_stop.is_set():
+                            break
+                        # ensure motor monitor exists
+                        mon1 = self.monitors[motor_idx1]
+                        if mon1 is None:
+                            name = self.pv_entries[motor_idx1].get().strip()
+                            mon1 = MotorMonitor(name, on_change=lambda v: None)
+                            mon1.start()
+                            self.monitors[motor_idx1] = mon1
+                        # move motor & settle
+                        mon1.pv.put(pos1)
+                        time.sleep(POLL_PERIOD * 5)
             
+                        # take multiple acquisitions
+                        for k in range(nacq):
+                            if self._scan_stop.is_set():
+                                break
+                            e = float(PV(self.ENERGY_PV).get())
+                            ds_e[i, j, k] = e
+                            time.sleep(POLL_PERIOD)
+            
+                        # flush after each row
+                        f.flush()
+
         # re-enable button & alert user on main thread
         self.after(0, lambda: self.scan_btn.config(state=tk.NORMAL))
-        self._stop_scan()
-        messagebox.showinfo("Scan complete", f"Data saved to:\n{fname}")
+        self.after(0, lambda: self.scan_btn.config(state=tk.DISABLED))
+        self.after(0, lambda: print("Scan complete", f"Data saved to:\n{fname}"))
+        
         
     def _stop_scan(self):
         self._scan_stop.set()
@@ -1009,7 +1064,12 @@ class App(tk.Tk):
             self.energy_values.pop(0)
             
         # schedule a GUI update
-        self.after(0, self._update_energy_plot)
+        try:
+            if self.winfo_exists():
+                self.after(0, self._update_energy_plot)
+        except tk.TclError:
+            print("tk error worked")
+            pass
 
     # ——— COMMON ACTIONS —————————————————————————————————————
     def _connect(self, idx):
