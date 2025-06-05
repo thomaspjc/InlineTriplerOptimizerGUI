@@ -29,7 +29,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.gridspec as gridspec
 import numpy as np
 import tkinter as tk, tkinter.font as tkfont
-
+import queue
 
 from tkinter import filedialog, messagebox
 import h5py
@@ -40,6 +40,8 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel as C
 
 from tqdm import tqdm
+tqdm.monitor_interval = 0
+
 
 
 text_font = None
@@ -51,7 +53,7 @@ STANFORD_BLUE   = "#006CB8"
 STANFORD_GREEN  = "#1AECBA"
 
 # Polling
-POLL_PERIOD = 0.01  # seconds between PV.get()
+POLL_PERIOD = 0.1  # seconds between PV.get() # needs to be greater than 0.08 for GUI to follow properly
 
 
 # ——— EPICS FALLBACK / TEST MODE —————————————————————————————
@@ -64,24 +66,27 @@ except ImportError:
         """Dummy PV class: stores values in a class-wide dict and computes dummy energy in test mode"""
         _storage = {}
         def __init__(self, name):
-            self.name = name
+            self.pvname = name
             PV._storage.setdefault(name, 0.0)
         def energy(self, theta1, theta2, pert1=0.1, pert2=0.5):
             """Dummy energy: |sinc(theta1-pert1)*sinc(theta2-pert2)|"""
             return abs(np.sinc(theta1-pert1)*np.sinc(theta2-pert2)) #+ ((np.random.random(1)) * 0.001)
         def get(self):
             # In test mode, compute dummy energy for the energy PV
-            if not EPICS_AVAILABLE and self.name == "PMTR:LR20:50:PWR":
+            if not EPICS_AVAILABLE and self.pvname == "PMTR:LR20:50:PWR":
                 # Motor positions are stored under MOTOR:TEST:PV1 and MOTOR:TEST:PV3
                 theta1 = PV._storage.get("MIRR:LR20:70:TRP1_MOTR_V", 1)
                 theta2 = PV._storage.get("MIRR:LR20:75:TRP2_MOTR_H", 0.0)
                 # Compute energy via the dummy energy() function
                 return float(self.energy(theta1, theta2))
+            
+            if not EPICS_AVAILABLE and len(self.pvname.split(".RBV")) == 2:
+                return PV._storage.get(self.pvname.split(".RBV")[0])
             # Default: return stored value
-            return PV._storage.get(self.name, 0.0)
+            return PV._storage.get(self.pvname, 0.0)
     
         def put(self, val):
-            PV._storage[self.name] = float(val)
+            PV._storage[self.pvname] = float(val)
         
         def DMOV(self):
             return True
@@ -96,9 +101,9 @@ except ImportError:
 # ——— MOTOR MONITOR THREAD —————————————————————————————————
 class MotorMonitor:
     """Background thread that polls one PV and fires on_change callback."""
-    def __init__(self, pv_name, on_change, poll=POLL_PERIOD):
+    def __init__(self, pv_name, data_q, poll=POLL_PERIOD):
         self.pv = PV(pv_name)
-        self.on_change = on_change
+        self.q = data_q
         self.poll = poll
         self._stop = threading.Event()
         self._thr  = threading.Thread(target=self._loop, daemon=True)
@@ -109,23 +114,23 @@ class MotorMonitor:
         
     def stop(self):
         self._stop.set()
-        self._thr.join(timeout = 2)
+        self._thr.join(timeout = 5)
+        #print('Motor Thread:', self._thr.is_alive())
+        self._thr = None
         
     def _loop(self):
         last = None
         while not self._stop.is_set():
-            try:
-                val = self.pv.get()
-            except Exception:
-                val = None
-            if val != last:
+            val = self.pv.get()
+            if val != last:                      # only push changes
                 last = val
-            #self.on_change(val)
-            try:
-                self.on_change(val)
-            except RuntimeError:
-                time.sleep(0)
+                try:                             # overwrite if queue full
+                    self.q.put_nowait(val)
+                except queue.Full:
+                    self.q.get_nowait()
+                    self.q.put_nowait(val)
             time.sleep(self.poll)
+        
 
 # ——— ENERGYMETER MONITOR THREAD —————————————————————————————————
 class EnergyMonitor:
@@ -133,9 +138,9 @@ class EnergyMonitor:
     Background thread that polls an EPICS PV (or dummy) for energy readings
     and calls your on_update callback whenever the value changes.
     """
-    def __init__(self, pv_name, on_update, poll=POLL_PERIOD):
+    def __init__(self, pv_name, energy_q, poll=POLL_PERIOD):
         self.pv        = PV(pv_name)
-        self.on_update = on_update
+        self.q         = energy_q
         self.poll      = poll
         self._stop     = threading.Event()
         self._thr      = threading.Thread(target=self._loop, daemon=True)
@@ -147,20 +152,19 @@ class EnergyMonitor:
 
     def stop(self):
         self._stop.set()
-        self._thr.join(timeout = 1)
+        self._thr.join()
+        self._thr = None
 
     def _loop(self):
         while not self._stop.is_set():
             try:
-                val = self.pv.get()
-            except Exception:
-                val = None
-            #self.on_update(val)
-            try:
-                self.on_update(val)
-            except RuntimeError:
-                time.sleep(0)
+                self.q.put(self.pv.get(), block=False)
+            except queue.Full:
+                print('Energy Queue was full –> data point was skipped')
+                pass                               # main thread will catch up
             time.sleep(self.poll)
+        
+        
             
             
 # ——— BO/GA Optimizer —————————————————————————————————
@@ -190,6 +194,8 @@ class Optimizer:
         self.THG = THG_pv
         self.energy = energy_pv
         self.poll = poll_period
+        
+        self.RBVs = [None]*4
     
     def _read_energy(self, jog1, jog2, timeout = 20, tol = 1e-5):
         """
@@ -209,31 +215,49 @@ class Optimizer:
 
         """
         self.SHG.put(jog1)
+        
+        rbv1 = self.RBVs[0]
+        if rbv1 is None:
+            name1 = self.SHG.pvname
+            name1 = name1 +".RBV"
+            rbv1 = PV(name1)
+            
+            self.RBVs[0] = rbv1
+
+        startRBV = time.time()
+        while True:
+            if jog1 == rbv1.get():
+                time.sleep(POLL_PERIOD/2) # could skip this and wait after the loops
+                break
+            # Hard Timeout that stops the process
+            if time.time() - startRBV > timeout:
+                raise RuntimeError(f"Motor move timed out after {timeout}s")
+            if time.time() - startRBV > timeout/5:
+                self.SHG.put(jog1)
+                
+                
         self.THG.put(jog2)
         
-        
-        #shg_done = self.SHG.status
-        #thg_done = self.THG.status
-        
-        start = time.time()
+        rbv2 = self.RBVs[1]
+        if rbv2 is None:
+            name2 = self.THG.pvname
+            name2 = name2 +".RBV"
+            rbv2 = PV(name2)
+            
+            self.RBVs[1] = rbv2
+
+        startRBV = time.time()
         while True:
-            # Hard Timeout that stops the process
-            if time.time() - start > timeout:
-                raise RuntimeError(f"Motor move timed out after {timeout}s")
-                
-            # Soft timeout -> requests the values again
-            if time.time() - start > timeout/3:
-                if np.abs(self.SHG.get() - jog1) > tol:
-                    self.SHG.put(jog1)
-                if np.abs(self.THG.get() - jog2) > tol:
-                    self.THG.put(jog2)
-            
-            # Confirming the location of the motor (gets request value rather than current rn)
-            if np.abs(self.SHG.get() - jog1) < tol and np.abs(self.THG.get() - jog2) < tol:
+            if jog2 == rbv2.get():
+                time.sleep(POLL_PERIOD/2)
                 break
-            
+            # Hard Timeout that stops the process
+            if time.time() - startRBV > timeout:
+                raise RuntimeError(f"Motor move timed out after {timeout}s")
+            if time.time() - startRBV > timeout/5:
+                self.THG.put(jog2)
+        # Could combine the the two loops if the motors can move at the same time 
         
-        time.sleep(4)#In place because we cannot compare the current values rn -> doesnt work well
         return float(self.energy.get())
     
     def expected_improvement(self, X, X_sample, Y_sample, gpr, xi=0.01):
@@ -419,19 +443,28 @@ class App(tk.Tk):
 
         """
         super().__init__()
+        
+        # ––– Setting up the closing protocol –––––––––––––––––––––––––––––––––
+        self._closing = False
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         
-        
-        
+        # ––– Setting up the GUI decor ––––––––––––––––––––––––––––––––––––––––
+        self._load_assets()
         self.title(f"Motor Control{' (TEST MODE)' if not EPICS_AVAILABLE else ''}")
+        # dark mode flag
+        self.dark_mode = False
+        # Tracking a 1D vs 2D scan 
+        self.scan_mode = tk.StringVar(value="1D")
         
-
+        # ––– Setting up the motors through epics –––––––––––––––––––––––––––––
         # state for 4 motors
-        self.monitors = [None]*4
-        self.currents = [0.0]*4
-        
+        self.monitors     = [None]*4
+        self.currents     = [0.0]*4
+        # one single-slot queue per motor
+        self._motor_qs = [queue.Queue(maxsize=1) for _ in range(4)]
         # widget refs
-        self.pv_entries  = [None]*4
+        self.pv_entries   = [None]*4
+        self.RBVs         = [None]*4
         
         self.cur_labels   = [0.0]*4
         self.pv_names     = ["MIRR:LR20:70:TRP1_MOTR_V",
@@ -439,32 +472,62 @@ class App(tk.Tk):
                              "MIRR:LR20:75:TRP2_MOTR_H",
                              "MIRR:LR20:75:TRP2_MOTR_V"
                              ]
-        self.step_entries = [0.0001]*4
-
-        # Tracking a 1D vs 2D scan 
-        self.scan_mode = tk.StringVar(value="1D")
+        self.step_entries = [0.0001]*4  
+        self.after(0, self._drain_motor_qs)
         
-        # dark mode flag
-        self.dark_mode = False
-        
+        # ––– Setting up the Energy Monitor through Epics –––––––––––––––––––––
         self.ENERGY_PV = "PMTR:LR20:50:PWR"  # Power Meter PV
         self.energy_times  = []
         self.energy_values = []
         self.energy_index = 0
-        
-        self._load_assets()
+        # instantiate and start the monitor
+        self._energy_q = queue.Queue(maxsize = 1)
+        self.energy_monitor = EnergyMonitor(self.ENERGY_PV, energy_q=self._energy_q)
+        self.after(0, self.energy_monitor.start)
+        self._plot_pending = False
+        self.after(0, self._drain_q)
         
         # event to tell optimizer/GA loops to quit early
+        # FIXME: Should the following be in another method ?
         self._kill_opt = threading.Event()
-        
-        # instantiate and start the monitor
-        self.energy_monitor = EnergyMonitor(self.ENERGY_PV, on_update=self._on_energy)
-        self.after(0, self.energy_monitor.start)
 
-        
+        # ––– Build the GUI and start the program –––––––––––––––––––––––––––––
         self._build_ui()
 
-        
+    def _drain_q(self):
+        if self._closing:
+            return                            # we’re shutting down – stop rescheduling
+        try:
+            val = self._energy_q.get_nowait()
+            self.energy_index += 1
+            self.energy_times.append(self.energy_index)
+            self.energy_values.append(val)
+            if len(self.energy_values) > 100:
+                self.energy_values.pop(0); self.energy_times.pop(0)
+            if not self._plot_pending:        # debounce – at most one draw in queue
+                self._plot_pending = True
+                self.after_idle(self._update_energy_plot)
+        except queue.Empty:
+            #print("Queue was empty")
+            pass
+            
+        finally:
+            # Re-arm ourselves ~10 ms later
+            self.after(int(POLL_PERIOD*1000), self._drain_q)
+            
+    def _drain_motor_qs(self):
+        if self._closing:
+            return                      # stop rescheduling during shutdown
+    
+        for idx, q in enumerate(self._motor_qs):
+            try:
+                val = q.get_nowait()
+            except queue.Empty:
+                continue
+            self.currents[idx] = val
+            self.cur_labels[idx].config(text=f"{val:.4g}")
+    
+        self.after(int(POLL_PERIOD*1000), self._drain_motor_qs)
 
     def _load_assets(self):
         """
@@ -630,9 +693,13 @@ class App(tk.Tk):
         self._kill_opt.set()
         self.stop_btn.config(state=tk.DISABLED)
         self.optimize_btn.config(state=tk.NORMAL)
-        if self._opt_thr is not None and self._opt_thr.is_alive():
+
+        if self._opt_thr is not None: #and self._opt_thr.is_alive():
             self._opt_stop.set()
-            self._opt_thr.join()
+            self._opt_thr.join(timeout = 5)
+            self._opt_thr = None
+
+
         
     def _run_opt(self):
         """
@@ -672,9 +739,8 @@ class App(tk.Tk):
         print(f"Refined result: θ = {best_theta_refined}, E = {best_e_refined:.6f}")
         
         # once done, re-enable Optimize button
-        self.after(0, self._stop_optimize())
+        self.after(0, self._stop_optimize)
 
-        return
 
     # ——— Tab 2: Manual Control —————————————————————————————
     def _build_manual_tab(self, parent):
@@ -902,8 +968,8 @@ class App(tk.Tk):
 
         except ValueError:
             messagebox.showerror("Invalid scan parameters",
-                                 "Please check motor #, start/stop/step, #acqs, and file.",
-                                 "The file extension should be h5")
+                                 "Please check motor #, start/stop/step, #acqs, and file.\n \
+                                 The file extension should be h5")
             return
         
         # 2) Disable the button & start scan thread
@@ -921,12 +987,13 @@ class App(tk.Tk):
         
         
     def _run_scan(self, motor_idx1, start1, stop1, step1, nacq, fname,
-                  motor_idx2 = None, start2 = None, stop2 = None, step2 = None):
-        
+                  motor_idx2 = None, start2 = None, stop2 = None, step2 = None, timeout = 15):
+        # Save to the scan folder
+        fname = "scans/" + fname
         if self.scan_mode.get() == '1D':
             # build positions array
-            positions = np.arange(start1, stop1 + 1e-12, step1)
-        
+            positions = np.arange(start1, stop1 + step1, step1)
+            
             # open HDF5 file
             with h5py.File(fname, "w") as f:
                 ds_p = f.create_dataset("positions", data=positions)
@@ -934,20 +1001,39 @@ class App(tk.Tk):
                                         shape=(len(positions), nacq),
                                         dtype="f8")
         
-                for i, pos in enumerate(positions):
+                for i in tqdm(range(len(positions)), ascii = True, desc = "Scanning Motors"):
+                    pos = positions[i]
                     if self._scan_stop.is_set():
                         break
                     # ensure motor monitor exists
                     mon = self.monitors[motor_idx1]
                     if mon is None:
                         name = self.pv_entries[motor_idx1].get().strip()
-                        mon = MotorMonitor(name, on_change=lambda v: None)
+                        mon = MotorMonitor(name, data_q = self._motor_qs[motor_idx1])
                         mon.start()
                         self.monitors[motor_idx1] = mon
+                        
+                    rbv = self.RBVs[motor_idx1]
+                    if rbv is None:
+                        name = self.pv_entries[motor_idx1].get().strip()
+                        name = name +".RBV"
+                        rbv = PV(name)
+                        
+                        self.RBVs[motor_idx1] = rbv
         
                     # move motor & settle
                     mon.pv.put(pos)
-                    time.sleep(POLL_PERIOD * 5)
+                    startRBV = time.time()
+                    while True:
+                        if pos == rbv.get():
+                            time.sleep(POLL_PERIOD)
+                            break
+                        # Hard Timeout that stops the process
+                        if time.time() - startRBV > timeout:
+                            raise RuntimeError(f"Motor move timed out after {timeout}s")
+                        if time.time() - startRBV > timeout/5:
+                            mon.pv.put(pos)
+                    
         
                     # take multiple acquisitions
                     for j in range(nacq):
@@ -984,13 +1070,34 @@ class App(tk.Tk):
 
                     if mon2 is None:
                         name = self.pv_entries[motor_idx2].get().strip()
-                        mon2 = MotorMonitor(name, on_change=lambda v: None)
+                        mon2 = MotorMonitor(name, data_q = self._motor_qs[motor_idx2])
                         mon2.start()
                         self.monitors[motor_idx2] = mon2
+                        
+                    rbv2 = self.RBVs[motor_idx2]
+                    if rbv2 is None:
+                        name2 = self.pv_entries[motor_idx2].get().strip()
+                        name2 = name2 +".RBV"
+                        rbv2 = PV(name2)
+                        
+                        self.RBVs[motor_idx2] = rbv2
                     # move motor & settle
                     mon2.pv.put(pos2)
                     positions1[:] = positions1[::-1]
-                    time.sleep(POLL_PERIOD * 5)
+                    startRBV = time.time()
+                    while True:
+                        if pos2 == rbv2.get():
+                            time.sleep(POLL_PERIOD)
+                            break
+                        # Hard Timeout that stops the process
+                        if time.time() - startRBV > timeout:
+                            raise RuntimeError(f"Motor move timed out after {timeout}s")
+                        # Soft Timeout that puts the motor position back 
+                        if time.time() - startRBV > timeout/5:
+                            mon2.pv.put(pos2)
+                    
+
+
                     
                     for j, pos1 in enumerate(positions1):
                         if self._scan_stop.is_set():
@@ -999,12 +1106,30 @@ class App(tk.Tk):
                         mon1 = self.monitors[motor_idx1]
                         if mon1 is None:
                             name = self.pv_entries[motor_idx1].get().strip()
-                            mon1 = MotorMonitor(name, on_change=lambda v: None)
+                            mon1 = MotorMonitor(name, data_q = self._motor_qs[motor_idx1])
                             mon1.start()
                             self.monitors[motor_idx1] = mon1
                         # move motor & settle
                         mon1.pv.put(pos1)
-                        time.sleep(POLL_PERIOD * 5)
+                        
+                        rbv1 = self.RBVs[motor_idx1]
+                        if rbv1 is None:
+                            name1 = self.pv_entries[motor_idx1].get().strip()
+                            name1 = name1 +".RBV"
+                            rbv1 = PV(name1)
+                            
+                            self.RBVs[motor_idx1] = rbv1
+                            
+                        while True:
+                            if pos1 == rbv1.get():
+                                time.sleep(POLL_PERIOD)
+                                break
+                            # Hard Timeout that stops the process
+                            if time.time() - startRBV > timeout:
+                                raise RuntimeError(f"Motor move timed out after {timeout}s")
+                            # Soft Timeout that puts the motor position back 
+                            if time.time() - startRBV > timeout/5:
+                                mon1.pv.put(pos1)
             
                         # take multiple acquisitions
                         for k in range(nacq):
@@ -1016,60 +1141,62 @@ class App(tk.Tk):
             
                         # flush after each row
                         f.flush()
+                f.close()
+
 
         # re-enable button & alert user on main thread
-        self.after(0, lambda: self.scan_btn.config(state=tk.NORMAL))
-        self.after(0, lambda: self.scan_btn.config(state=tk.DISABLED))
+        '''self.after(0, lambda: self.scan_btn.config(state=tk.NORMAL))
+        self.after(0, lambda: self.stop_scan_btn.config(state=tk.DISABLED))'''
         self.after(0, lambda: print("Scan complete", f"Data saved to:\n{fname}"))
-        
+        self.after(0, self._stop_scan)
         
     def _stop_scan(self):
+        self.scan_btn.config(state=tk.NORMAL)
+        self.stop_scan_btn.config(state=tk.DISABLED)
         self._scan_stop.set()
         self._scan_thr.join()
+        self._scan_thr = None
+        
 
     def _update_energy_plot(self):
         """Redraw the energy plot in Tab 1."""
-        self.axE.cla()
-        clr = STANFORD_BLUE if not self.dark_mode else STANFORD_GREEN
-        self.line_energy, = self.axE.plot(self.energy_times, self.energy_values, '-x', color = clr)
-        #self.line_energy.set_data(self.energy_times, self.energy_values)
-        self.axE.set_xlabel("Time")
-        self.axE.set_ylabel("Sample #")
-        # make sure the plot uses the current dark/light colors
-        if self.dark_mode:
-            self.axE.set_facecolor("#000000")
-            for spine in self.axE.spines.values():
-                spine.set_color("white")
-            self.axE.xaxis.label.set_color("white")
-            self.axE.yaxis.label.set_color("white")
-            self.axE.tick_params(colors="white")
-            self.line_energy.set_color(STANFORD_GREEN)
-        else:
-            self.axE.set_facecolor("white")
-            for spine in self.axE.spines.values():
-                spine.set_color("black")
-            self.axE.xaxis.label.set_color("black")
-            self.axE.yaxis.label.set_color("black")
-            self.axE.tick_params(colors="black")
-            self.line_energy.set_color(STANFORD_BLUE)
-        self._energy_canvas.draw_idle()
-        
-    def _on_energy(self, val):
-        """Called in the monitor thread whenever the energy PV changes."""
-        self.energy_index += 1
-        self.energy_times.append(self.energy_index)
-        self.energy_values.append(val)
-        if len(self.energy_values) > 100:
-            self.energy_times.pop(0)
-            self.energy_values.pop(0)
-            
-        # schedule a GUI update
         try:
+            
             if self.winfo_exists():
-                self.after(0, self._update_energy_plot)
+                self.axE.cla()
+                clr = STANFORD_BLUE if not self.dark_mode else STANFORD_GREEN
+                self.line_energy, = self.axE.plot(self.energy_times, self.energy_values, '-x', color = clr)
+                #self.line_energy.set_data(self.energy_times, self.energy_values)
+                self.axE.set_xlabel("Time")
+                self.axE.set_ylabel("Sample #")
+                # make sure the plot uses the current dark/light colors
+                
+                if self.dark_mode:
+                    self.axE.set_facecolor("#000000")
+                    for spine in self.axE.spines.values():
+                        spine.set_color("white")
+                    self.axE.xaxis.label.set_color("white")
+                    self.axE.yaxis.label.set_color("white")
+                    self.axE.tick_params(colors="white")
+                    self.line_energy.set_color(STANFORD_GREEN)
+                else:
+                    self.axE.set_facecolor("white")
+                    for spine in self.axE.spines.values():
+                        spine.set_color("black")
+                    self.axE.xaxis.label.set_color("black")
+                    self.axE.yaxis.label.set_color("black")
+                    self.axE.tick_params(colors="black")
+                    self.line_energy.set_color(STANFORD_BLUE)
+                self._energy_canvas.draw_idle()
+                
+            
         except tk.TclError:
-            print("tk error worked")
+            #print("tk error worked")
             pass
+        self._plot_pending = False
+        
+        
+            
 
     # ——— COMMON ACTIONS —————————————————————————————————————
     def _connect(self, idx):
@@ -1079,16 +1206,10 @@ class App(tk.Tk):
             return
         if self.monitors[idx]:
             self.monitors[idx].stop()
-        mon = MotorMonitor(name,
-                           on_change=lambda v,i=idx: self._on_val(i,v))
+        mon = MotorMonitor(name, data_q = self._motor_qs[idx])
         self.monitors[idx] = mon
         mon.start()
 
-    def _on_val(self, idx, val):
-        """Called in the monitor thread — schedule a GUI update."""
-        self.currents[idx] = val
-        txt = f"{val:.4g}"
-        self.after(0, self.cur_labels[idx].config, {"text": txt})
 
     def _jog(self, idx, direction):
         """Move motor idx by ±step."""
@@ -1101,7 +1222,7 @@ class App(tk.Tk):
         mon = self.monitors[idx]
         if mon:
             mon.pv.put(new)
-            self._on_val(idx, new)
+
 
     def _toggle_dark(self):
         """Flip light/dark, recolor all widgets, restyle tabs & center them."""
@@ -1227,14 +1348,16 @@ class App(tk.Tk):
             
     def _on_close(self):
         print('Closing App')
+        self._closing = True
         # stop all monitors cleanly
         for m in self.monitors:
             if m: m.stop()
+                
         print('  Motor Monitors killed...')
         if self.energy_monitor:
-            self.energy_monitor.stop()
+                self.energy_monitor.stop()
         print('  Energy Monitor killed...')
-
+        
         if getattr(self, '_scan_thr', None) and self._scan_thr.is_alive():
             self.stop_scan()
 
@@ -1244,6 +1367,8 @@ class App(tk.Tk):
         print('  Optimizer Thread killed...')
         
         print('Exiting')
+        for t in threading.enumerate():
+            print(t.name, t.daemon, t.is_alive())
         time.sleep(0.2)
         self.destroy()
 
